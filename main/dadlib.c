@@ -37,14 +37,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             
             xSemaphoreGive(ready_sem);
 
-            // Publish a number upon connection
-            {
-                int number = 42;
-                char payload[10];
-                sprintf(payload, "%d", number);
-                int msg_id = esp_mqtt_client_publish(mqtt_client, config.mqtt_topic, payload, 0, 1, 0);
-                ESP_LOGI(TAG, "Published message with ID: %d", msg_id);
-            }
+            // TODO set a message to a particular topic saying that we have started up
             break;
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGI(TAG, "MQTT Disconnected.");
