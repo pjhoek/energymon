@@ -10,6 +10,8 @@
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 
+#define MQTT_OUT_TOPIC "esp32/energymon/measurement"
+
 #define CONVST_PIN GPIO_NUM_4 // GPIO4 - Start conversion
 #define BUSY_PIN GPIO_NUM_27  // GPIO27 - Conversion status
 #define CS_PIN GPIO_NUM_15    // GPIO15 - Chip select
@@ -20,14 +22,12 @@
 #define MOSI_PIN GPIO_NUM_19 // GPIO19 - MOSI (unused)
 
 #define NUM_SAMPLES 2000
-static const double LSB_10V = 20.0 / 262144.0;
-static const double V_FS_240Volt = LSB_10V * 509.9576;
-static const int32_t OFFSET[8] = {5, 0, -5, 2, 1, 4, -4, -1};
 
 #define VOLTAGE_CH 1
 
 static uint8_t rawBytes[18];
 static int32_t adcData[NUM_SAMPLES][8];
+static int32_t adcOffset[8]; // offsets for calibration
 static double calcAvg[8];
 static double calcRms[8];
 static double calcPwr[8];
@@ -115,7 +115,7 @@ static void readAllChannels(spi_device_handle_t spi, int32_t *data)
         {
             val |= 0xFFFC0000;
         }
-        data[ch] = val - OFFSET[ch];
+        data[ch] = val - adcOffset[ch];
     }
 }
 
@@ -195,37 +195,21 @@ static bool findEndpoints(int *outStartSample, int *outEndSample)
 static void publishResults()
 {
     char buf[512];
-    int ret = snprintf(buf, sizeof(buf),
-                       "{ \"RMS0_volts\": %.6lf, \"RMS1\": %.6lf, \"RMS2\": %.6lf, \"RMS3\": %.6lf,"
-                       "  \"RMS4\": %.6lf, \"RMS5\": %.6lf, \"RMS6\": %.6lf, \"RMS7\": %.6lf,"
-                       "  \"PWR1\": %.6lf }",
-                       // calcRms[0] * V_FS_240Volt,
-                       // calcRms[0] * LSB_10V,
-                       // calcRms[1] * LSB_10V,
-                       // calcRms[2] * LSB_10V,
-                       // calcRms[3] * LSB_10V,
-                       // calcRms[4] * LSB_10V,
-                       // calcRms[5] * LSB_10V,
-                       // calcRms[6] * LSB_10V,
-                       // calcRms[7] * LSB_10V,
-                       // calcPwr[1] * V_FS_240Volt * LSB_10V);
-
-                       calcAvg[0],
-                       calcAvg[1],
-                       calcAvg[2],
-                       calcAvg[3],
-                       calcAvg[4],
-                       calcAvg[5],
-                       calcAvg[6],
-                       calcAvg[7],
-                       calcPwr[1] * V_FS_240Volt * LSB_10V);
+    int ret = snprintf(buf, sizeof(buf), "{\"primaryCh\":%d,"
+                                         "\"avg\":[%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf],"
+                                         "\"rms\":[%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf],"
+                                         "\"pwr\":[%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf]}",
+                       VOLTAGE_CH,
+                       calcAvg[0], calcAvg[1], calcAvg[2], calcAvg[3], calcAvg[4], calcAvg[5], calcAvg[6], calcAvg[7],
+                       calcRms[0], calcRms[1], calcRms[2], calcRms[3], calcRms[4], calcRms[5], calcRms[6], calcRms[7],
+                       calcPwr[0], calcPwr[1], calcPwr[2], calcPwr[3], calcPwr[4], calcPwr[5], calcPwr[6], calcPwr[7]);
 
     if (ret < 0 || ret >= sizeof(buf))
     {
         dadlib_panic("MQTT JSON buffer too small");
     }
 
-    if (dadlib_mqtt_publish(buf, 0, 1) < 0)
+    if (dadlib_mqtt_publish(MQTT_OUT_TOPIC, buf, 0, 1) < 0)
     {
         ESP_LOGW("app", "MQTT publish failed");
         printf("%s\n", buf); // Print JSON to terminal every time
@@ -254,9 +238,59 @@ static void loop(spi_device_handle_t spi)
     publishResults(); // Send to MQTT
 }
 
+static bool offsets_initialized = false;
+static SemaphoreHandle_t offsets_initialized_sem;
+static StaticSemaphore_t offsets_initialized_sem_buff;
+
+static void handle_mqtt_set_offset(const char *data, int len) {
+    printf("received offset data: %.*s\n", len, data);
+
+    if (offsets_initialized) {
+        ESP_LOGE("app", "offsets were already initialized, restarting");
+        dadlib_panic("offset fail");
+    }
+
+    printf("setting offsets to: ");
+
+    const char *cur = data;
+    for (int i = 0; i < 8; i++) {
+        char *end;
+        long val = strtol(cur, &end, 10);
+        if (end == cur) {
+            ESP_LOGE("app", "invalid offset data for index %d", i);
+            dadlib_panic("offset fail");
+        }
+
+        adcOffset[i] = (int32_t) val;
+        printf("%ld, ", adcOffset[i]);
+
+        cur = end;
+        if (*cur != ',') {
+            ESP_LOGE("app", "expected a comma after parsing index %d", i);
+            dadlib_panic("offset fail");
+        }
+        cur++;
+    }
+
+    printf("\n");
+
+    offsets_initialized = true;
+    xSemaphoreGive(offsets_initialized_sem);
+}
+
 void app_main()
 {
     printf("Starting energy monitor...\n");
+    
+    offsets_initialized_sem = xSemaphoreCreateBinaryStatic(&offsets_initialized_sem_buff);
+
+    static dadlib_mqtt_topic_handler_t mqtt_subscribe_topics[] = {
+        {
+            .topic = "esp32/energymon/offset",
+            .handler = handle_mqtt_set_offset,
+        },
+        { 0 }
+    };
 
     dadlib_config_t config = {
         .wifi_ssid = "PRINTER24",
@@ -264,8 +298,8 @@ void app_main()
 
         .mqtt_user = "power",
         .mqtt_pass = "123456",
-        .mqtt_broker_url = "mqtts://192.168.1.61:8885",
-        .mqtt_topic = "esp32/energymon",
+        .mqtt_broker_url = "mqtts://192.168.1.19:8883",
+        .mqtt_subscribe_topics = mqtt_subscribe_topics,
 
         .skip_wait_for_wifi_and_mqtt = false,
     };
@@ -301,6 +335,11 @@ void app_main()
         .queue_size = 1};
     spi_device_handle_t spi;
     ESP_ERROR_CHECK(spi_bus_add_device(HSPI_HOST, &devcfg, &spi));
+
+    // wait until all adc offsets are initialized
+    if (!xSemaphoreTake(offsets_initialized_sem, pdMS_TO_TICKS(5000))) {
+        dadlib_panic("took too long to initialize offsets");
+    }
 
     while (true)
     {
