@@ -3,6 +3,7 @@
 #include <inttypes.h>
 #include <math.h>
 #include "sdkconfig.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -15,13 +16,13 @@
 #define RESET_PIN GPIO_NUM_25 // GPIO25 - Hardware reset
 
 #define SCK_PIN GPIO_NUM_5   // GPIO5 - SCK
-#define MISO_PIN GPIO_NUM_21 // GPIO21 - MISO
+#define MISO_PIN GPIO_NUM_21 // GPIO21 - MISO (MASTER IN, SLAVE OUT)
 #define MOSI_PIN GPIO_NUM_19 // GPIO19 - MOSI (unused)
 
 #define NUM_SAMPLES 2000
 static const double LSB_10V = 20.0 / 262144.0;
 static const double V_FS_240Volt = LSB_10V * 509.9576;
-static const int32_t OFFSET[8] = {10,1,-1,5,-2,3,-6,-1};
+static const int32_t OFFSET[8] = {5,0,-5,2,1,4,-4,-1};
 
 #define VOLTAGE_CH 1
 
@@ -30,17 +31,6 @@ static int32_t adcData[NUM_SAMPLES][8];
 static double calcAvg[8];
 static double calcRms[8];
 static double calcPwr[8];
-
-// dadlib config
-dadlib_config_t config = {
-    .wifi_ssid = "PRINTER24",
-    .wifi_pass = "herein3016830168.",
-
-    .mqtt_user = "power",
-    .mqtt_pass = "123456",
-    .mqtt_broker_url = "mqtts://192.168.1.61:8885",
-    .mqtt_topic = "esp32/energymon",
-};
 
 static void setup_pin_input(int pin)
 {
@@ -76,6 +66,7 @@ static void calcRmsAndPower(int ch, int startSample, int endSample)
         sumRms += val * val;
         sumPwr += val * adcData[i][VOLTAGE_CH];
     }
+
     uint32_t numSamples = endSample - startSample;
     calcAvg[ch] = ((double)sum) / ((double)numSamples);
     calcRms[ch] = sqrt(((double)sumRms) / ((double)numSamples));
@@ -89,9 +80,12 @@ static bool waitForBusy(int state, uint32_t timeoutMicros)
     {
         if (esp_timer_get_time() - then > timeoutMicros)
         {
+            // Timeout
             return false;
         }
     }
+
+    // BUSY is now in state `state`
     return true;
 }
 
@@ -142,21 +136,45 @@ static void readAllChannels(spi_device_handle_t spi, int32_t *data)
     }
 }
 
+// set true for DC testing, false for AC
+#define DC_MODE 1
+
 static bool findEndpoints(int *outStartSample, int *outEndSample)
 {
-    int startSample = 1;
-    bool sign = adcData[0][VOLTAGE_CH] >= 0;
-    while (startSample < NUM_SAMPLES && ((adcData[startSample][VOLTAGE_CH] >= 0) == sign))
-        startSample++;
+    if (DC_MODE)
+    {
+        *outStartSample = 0;
+        *outEndSample = NUM_SAMPLES - 1;
+        return true;
+    }
 
-    if (startSample == NUM_SAMPLES) return false;
+    int startSample = 1;
+
+    bool sign = adcData[0][VOLTAGE_CH] >= 0;
+
+    //  Advance `startSample` to the first sample which differs in sign from the literal zeroth sample (this has to be a zero crossing)
+    while (startSample < NUM_SAMPLES && ((adcData[startSample][VOLTAGE_CH] >= 0) == sign))
+    {
+        startSample++;
+    }
+
+    if (startSample == NUM_SAMPLES)
+    {
+        printf("sample overflow finding zero crossing\n");
+        return false;
+    }
 
     int halfPeriods = 0;
     int endSample = startSample;
     bool endSign = adcData[endSample][VOLTAGE_CH] >= 0;
+
+    // Scan over all of the samples after `startSample` until the end
     for (int currentSample = startSample + 1; currentSample < NUM_SAMPLES; currentSample++)
     {
         bool currentSign = adcData[currentSample][VOLTAGE_CH] >= 0;
+
+        // If the current sample now has a different sign to the last saved "end sample", updated
+        // the saved "end sample" to this position (we have just found another zero crossing).
         if (currentSign != endSign)
         {
             endSample = currentSample;
@@ -164,7 +182,28 @@ static bool findEndpoints(int *outStartSample, int *outEndSample)
             halfPeriods++;
         }
     }
-    if (!halfPeriods) return false;
+
+    printf("%d\n", halfPeriods);
+
+    if (!halfPeriods)
+    {
+        printf("didn't find any half periods!?!\n");
+        return false;
+    }
+
+    // Have we see roughly the expected number of half periods?
+    // NOTE: 138 samples/halfperiod is a reasonable estimate for x16 oversampling, and
+    // should be suitably multiplied/divided if the oversampling rate is changed.
+#define EXPECTED_SAMPLES_PER_HALFPERIOD 136
+
+    if (abs((halfPeriods * EXPECTED_SAMPLES_PER_HALFPERIOD) - (endSample - startSample)) > NUM_SAMPLES / 200)
+    {
+        printf("half periods and range disagree! halfPeriods=%d: %d vs %d - %d = %d\n", halfPeriods,
+            halfPeriods * EXPECTED_SAMPLES_PER_HALFPERIOD,
+            endSample, startSample, endSample - startSample);
+        return false;
+    }
+
     *outStartSample = startSample;
     *outEndSample = endSample;
     return true;
@@ -178,20 +217,33 @@ static void publishResults()
         "  \"RMS4\": %.6lf, \"RMS5\": %.6lf, \"RMS6\": %.6lf, \"RMS7\": %.6lf,"
         "  \"PWR1\": %.6lf }",
         // calcRms[0] * V_FS_240Volt,
-        calcRms[0] * LSB_10V,
-        calcRms[1] * LSB_10V,
-        calcRms[2] * LSB_10V,
-        calcRms[3] * LSB_10V,
-        calcRms[4] * LSB_10V,
-        calcRms[5] * LSB_10V,
-        calcRms[6] * LSB_10V,
-        calcRms[7] * LSB_10V,
+        // calcRms[0] * LSB_10V,
+        // calcRms[1] * LSB_10V,
+        // calcRms[2] * LSB_10V,
+        // calcRms[3] * LSB_10V,
+        // calcRms[4] * LSB_10V,
+        // calcRms[5] * LSB_10V,
+        // calcRms[6] * LSB_10V,
+        // calcRms[7] * LSB_10V,
+        // calcPwr[1] * V_FS_240Volt * LSB_10V);
+
+        calcAvg[0],
+        calcAvg[1],
+        calcAvg[2],
+        calcAvg[3],
+        calcAvg[4],
+        calcAvg[5],
+        calcAvg[6],
+        calcAvg[7],
         calcPwr[1] * V_FS_240Volt * LSB_10V);
 
     if (ret < 0 || ret >= sizeof(buf)) {
         dadlib_panic("MQTT JSON buffer too small");
-    } else {
-        dadlib_mqtt_publish(buf, 0, 1);
+    }
+
+    if (dadlib_mqtt_publish(buf, 0, 1) < 0) {
+        ESP_LOGW("app", "MQTT publish failed");
+        printf("%s\n", buf); // Print JSON to terminal every time
     }
 }
 
@@ -215,7 +267,17 @@ void app_main()
 {
     printf("Starting energy monitor...\n");
 
-    // init dadlib
+    dadlib_config_t config = {
+        .wifi_ssid = "PRINTER24",
+        .wifi_pass = "herein3016830168.",
+
+        .mqtt_user = "power",
+        .mqtt_pass = "123456",
+        .mqtt_broker_url = "mqtts://192.168.1.61:8885",
+        .mqtt_topic = "esp32/energymon",
+
+        .skip_wait_for_wifi_and_mqtt = false
+    };
     dadlib_init(&config);
 
     setup_pin_output(CONVST_PIN);
@@ -231,7 +293,7 @@ void app_main()
     gpio_set_level(RESET_PIN, 1);
     esp_rom_delay_us(1);
     gpio_set_level(RESET_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(1));
+    vTaskDelay(pdMS_TO_TICKS(500));
 
     spi_bus_config_t buscfg = {
         .mosi_io_num = MOSI_PIN,
@@ -250,13 +312,18 @@ void app_main()
         .queue_size = 1};
     spi_device_handle_t spi;
     ESP_ERROR_CHECK(spi_bus_add_device(HSPI_HOST, &devcfg, &spi));
-
+    
     while (true)
     {
         loop(spi);
-        vTaskDelay(pdMS_TO_TICKS(2000)); // send every 2s
+        vTaskDelay(1);
     }
 }
+
+
+
+
+
 // #include "dadlib.h"
 
 // #include <stdio.h>

@@ -14,6 +14,8 @@ static bool handler_registered = false;
 static esp_mqtt_client_handle_t mqtt_client;
 
 static bool mqtt_started = false;
+
+static bool ready = false;
 static SemaphoreHandle_t ready_sem;
 static StaticSemaphore_t ready_sem_buff;
 
@@ -21,6 +23,10 @@ static dadlib_config_t config;
 
 // version of `esp_mqtt_client_publish` for dadlib
 int dadlib_mqtt_publish(const char *data, int qos, int retain) {
+    if (!ready) {
+        ESP_LOGW(TAG, "MQTT not started yet, cannot publish");
+        return -1;
+    }
     return esp_mqtt_client_publish(mqtt_client, config.mqtt_topic, data, strlen(data), qos, retain);
 }
 
@@ -35,6 +41,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "MQTT Connected!");
             
+            ready = true;
             xSemaphoreGive(ready_sem);
 
             // TODO set a message to a particular topic saying that we have started up
@@ -161,6 +168,7 @@ void dadlib_init(const dadlib_config_t *user_config)
     config.mqtt_pass = strdup(user_config->mqtt_pass);
     config.mqtt_broker_url = strdup(user_config->mqtt_broker_url);
     config.mqtt_topic = strdup(user_config->mqtt_topic);
+    config.skip_wait_for_wifi_and_mqtt = user_config->skip_wait_for_wifi_and_mqtt;
 
     ready_sem = xSemaphoreCreateBinaryStatic(&ready_sem_buff);
 
@@ -213,8 +221,10 @@ void dadlib_init(const dadlib_config_t *user_config)
     // Log initialization complete; actual connection happens asynchronously
     ESP_LOGI(TAG, "Wi-Fi initialization complete, connecting to %s...", config.wifi_ssid);
 
-    // Wait until connected (blocking)
-    xSemaphoreTake(ready_sem, portMAX_DELAY);
+    if(!config.skip_wait_for_wifi_and_mqtt) {
+        // Wait until connected (blocking)
+        xSemaphoreTake(ready_sem, portMAX_DELAY);
+    }
 
     // We are done!
     ESP_LOGI(TAG, "dadlib initialization complete");
