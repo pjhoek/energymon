@@ -8,6 +8,7 @@
 #include "mqtt_client.h"
 #include "esp_tls.h"
 #include <string.h>
+#include "driver/gpio.h" // Add for gpio_config_t
 
 static const char *TAG = "dadlib";
 static bool handler_registered = false;
@@ -228,4 +229,26 @@ void dadlib_init(const dadlib_config_t *user_config)
 
     // We are done!
     ESP_LOGI(TAG, "dadlib initialization complete");
+}
+
+void dadlib_setup_pin_input(int pin)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << pin),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE};
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+}
+
+void dadlib_setup_pin_output(int pin)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << pin),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE};
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
 }

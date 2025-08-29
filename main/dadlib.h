@@ -21,4 +21,7 @@ void dadlib_init(const dadlib_config_t *cfg);
 void dadlib_panic(const char *error) __attribute__((noreturn));
 int dadlib_mqtt_publish(const char *data, int qos, int retain);
 
+void dadlib_setup_pin_input(int pin);
+void dadlib_setup_pin_output(int pin);
+
 #endif
