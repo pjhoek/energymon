@@ -21,6 +21,9 @@
 #define MISO_PIN GPIO_NUM_21 // GPIO21 - MISO (MASTER IN, SLAVE OUT)
 #define MOSI_PIN GPIO_NUM_19 // GPIO19 - MOSI (unused)
 
+#define BLUE_LED GPIO_NUM_32 // GPIO32 - Blue LED
+
+
 #define NUM_SAMPLES 2000
 
 #define VOLTAGE_CH 1
@@ -191,6 +194,16 @@ static bool findEndpoints(int *outStartSample, int *outEndSample)
     *outEndSample = endSample;
     return true;
 }
+static void setLedStatus()
+{
+    if (calcPwr[VOLTAGE_CH] < 0) {
+        // printf("Power detected: %.2lf W\n", calcPwr[VOLTAGE_CH]);
+        gpio_set_level(BLUE_LED, 1);
+    } else {
+        gpio_set_level(BLUE_LED,  0);
+    }
+
+}
 
 static void publishResults()
 {
@@ -235,6 +248,7 @@ static void loop(spi_device_handle_t spi)
         calcRmsAndPower(ch, startSample, endSample);
     }
 
+    setLedStatus();
     publishResults(); // Send to MQTT
 }
 
@@ -289,7 +303,8 @@ void app_main()
             .topic = "esp32/energymon/offset",
             .handler = handle_mqtt_set_offset,
         },
-        { 0 }
+        { NULL }
+        // add hanlder for DC_MODE toggle here if needed
     };
 
     dadlib_config_t config = {
@@ -298,7 +313,7 @@ void app_main()
 
         .mqtt_user = "power",
         .mqtt_pass = "123456",
-        .mqtt_broker_url = "mqtts://192.168.1.19:8883",
+        .mqtt_broker_url = "mqtts://192.168.1.61:8885",
         .mqtt_subscribe_topics = mqtt_subscribe_topics,
 
         .skip_wait_for_wifi_and_mqtt = false,
@@ -309,6 +324,7 @@ void app_main()
     dadlib_setup_pin_input(BUSY_PIN);
     dadlib_setup_pin_output(CS_PIN);
     dadlib_setup_pin_output(RESET_PIN);
+    dadlib_setup_pin_output(BLUE_LED);
 
     gpio_set_level(CONVST_PIN, 1);
     gpio_set_level(CS_PIN, 1);
