@@ -11,20 +11,26 @@
 #include "driver/gpio.h" // Add for gpio_config_t
 
 static const char *TAG = "dadlib";
-static bool handler_registered = false;
-static esp_mqtt_client_handle_t mqtt_client;
 
-static bool mqtt_started = false;
+#define EVENT_STARTUP_COMPLETE (1 << 0) // (set once) event representing when startup has been completed and `dadlib_init` should return
+#define EVENT_MQTT_STARTED     (1 << 1) // (set once) event representing when the esp-idf MQTT client has been started up (must only happen once)
+#define EVENT_WIFI_UP          (1 << 2) // (live updating) is the wifi currently connected (+ we got an ip address)?
+#define EVENT_MQTT_UP          (1 << 3) // (live updating) is the mqtt currently connected? 
 
-static bool ready = false;
-static SemaphoreHandle_t ready_sem;
-static StaticSemaphore_t ready_sem_buff;
+static EventGroupHandle_t events;
+static StaticEventGroup_t events_buff;
 
 static dadlib_config_t config;
 
+static esp_mqtt_client_handle_t mqtt_client;
+
+bool dadlib_is_connected() {
+    return (xEventGroupGetBits(events) & EVENT_WIFI_UP) && (xEventGroupGetBits(events) & EVENT_MQTT_UP);
+}
+
 // version of `esp_mqtt_client_publish` for dadlib
 int dadlib_mqtt_publish(const char *topic, const char *data, int qos, int retain) {
-    if (!ready) {
+    if (!(xEventGroupGetBits(events) & EVENT_STARTUP_COMPLETE)) {
         ESP_LOGW(TAG, "MQTT not started yet, cannot publish");
         return -1;
     }
@@ -41,6 +47,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             break;
         }
         case MQTT_EVENT_CONNECTED: {
+            xEventGroupSetBits(events, EVENT_MQTT_UP);
             ESP_LOGI(TAG, "MQTT Connected!");
 
             dadlib_mqtt_topic_handler_t *current = config.mqtt_subscribe_topics;
@@ -53,17 +60,18 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 current++;
             }
             
-            ready = true;
-            xSemaphoreGive(ready_sem);
+            xEventGroupSetBits(events, EVENT_STARTUP_COMPLETE);
 
             // TODO set a message to a particular topic saying that we have started up
             break;
         }
         case MQTT_EVENT_DISCONNECTED: {
+            xEventGroupClearBits(events, EVENT_MQTT_UP);
             ESP_LOGI(TAG, "MQTT Disconnected.");
             break;
         }
         case MQTT_EVENT_ERROR: {
+            xEventGroupClearBits(events, EVENT_MQTT_UP);
             ESP_LOGI(TAG, "MQTT Error: %s", esp_err_to_name(event->error_handle->error_type));
             if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
                 ESP_LOGI(TAG, "Last error code: 0x%x", event->error_handle->esp_tls_last_esp_err);
@@ -102,10 +110,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 }
 
 static void start_mqtt() {
-    if (mqtt_started) {
+    if (xEventGroupGetBits(events) & EVENT_MQTT_STARTED) {
         return;
     }
-    mqtt_started = true;
+    xEventGroupSetBits(events, EVENT_MQTT_STARTED);
 
     // For insecure skip to work:
     // 1) Leave .broker.verification empty (no CA/PSK/global store)
@@ -141,40 +149,20 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     // Event: Wi-Fi disconnected
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGI(TAG, "Wi-Fi disconnected, retrying...");
+
+        xEventGroupClearBits(events, EVENT_WIFI_UP);
         esp_wifi_connect();  // Retry connecting automatically
     }
     // Event: Got IP address from AP
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Connected! Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+
+        xEventGroupSetBits(events, EVENT_WIFI_UP);
         start_mqtt(); // Start MQTT after IP acquisition
     } else {
         ESP_LOGW(TAG, "Unhandled Wi-Fi event: 0x%X (ID: %ld)", 
                  (unsigned int) event_base, event_id);
-    }
-}
-
-// Register Wi-Fi event handlers (only once)
-static void register_wifi_handlers_once(void)
-{
-    if (!handler_registered) {
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(
-            WIFI_EVENT,
-            ESP_EVENT_ANY_ID,
-            &wifi_event_handler,
-            NULL,
-            NULL
-        ));
-
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(
-            IP_EVENT,
-            IP_EVENT_STA_GOT_IP,
-            &wifi_event_handler,
-            NULL,
-            NULL
-        ));
-
-        handler_registered = true; // Mark as registered
     }
 }
 
@@ -218,7 +206,7 @@ void dadlib_init(const dadlib_config_t *user_config)
 
     config.skip_wait_for_wifi_and_mqtt = user_config->skip_wait_for_wifi_and_mqtt;
 
-    ready_sem = xSemaphoreCreateBinaryStatic(&ready_sem_buff);
+    events = xEventGroupCreateStatic(&events_buff);
 
 #if CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY
     ESP_LOGW(TAG, "INSECURE TLS BUILD: server certificate verification is DISABLED.");
@@ -249,7 +237,20 @@ void dadlib_init(const dadlib_config_t *user_config)
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
 
     // Step 4: Register event handlers
-    register_wifi_handlers_once();  // Safe, only registers once
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT,
+        ESP_EVENT_ANY_ID,
+        &wifi_event_handler,
+        NULL,
+        NULL
+    ));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT,
+        IP_EVENT_STA_GOT_IP,
+        &wifi_event_handler,
+        NULL,
+        NULL
+    ));
 
     // Step 5: Configure Wi-Fi connection
     wifi_config_t wifi_config;
@@ -273,7 +274,7 @@ void dadlib_init(const dadlib_config_t *user_config)
 
     if(!config.skip_wait_for_wifi_and_mqtt) {
         // Wait until connected (blocking)
-        xSemaphoreTake(ready_sem, portMAX_DELAY);
+        xEventGroupWaitBits(events, EVENT_STARTUP_COMPLETE, pdFALSE, pdFALSE, portMAX_DELAY);
     }
 
     // We are done!
