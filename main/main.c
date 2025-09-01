@@ -215,32 +215,25 @@ static bool findEndpoints(int *outStartSample, int *outEndSample)
 }
 
 static void setLedStatus() {
-    gpio_set_level( BLUE_LED, calcPwr[mainsCurrentCh] < -0.5);
-    gpio_set_level(  RED_LED, esp_timer_get_time() - lastErrorTimeUs < ERROR_LED_TIMEOUT_US);
-    gpio_set_level(GREEN_LED, dadlib_is_connected());
+    gpio_set_level( BLUE_LED, calcPwr[mainsCurrentCh] < -5000.0); // indicator: net power is negative
+    gpio_set_level(  RED_LED, dcMode || esp_timer_get_time() - lastErrorTimeUs < ERROR_LED_TIMEOUT_US); // indicator: alert (dc mode on or unexpected signal)
+    gpio_set_level(GREEN_LED, dadlib_is_connected()); // indicator: connected to wifi + mqtt
 }
 
-static void publishResults()
+static void prepareResultsJson(char *buf, size_t size)
 {
-    char buf[512];
-    int ret = snprintf(buf, sizeof(buf), "{\"dcMode\":%s,\"mainsVoltageCh\":%d,"
-                                         "\"avg\":[%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf],"
-                                         "\"rms\":[%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf],"
-                                         "\"pwr\":[%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf]}",
+    int ret = snprintf(buf, size, "{\"dcMode\":%s,\"mainsVoltageCh\":%d,"
+                                   "\"avg\":[%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf],"
+                                   "\"rms\":[%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf],"
+                                   "\"pwr\":[%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf,%.6lf]}",
                        dcMode ? "true" : "false", mainsVoltageCh,
                        calcAvg[0], calcAvg[1], calcAvg[2], calcAvg[3], calcAvg[4], calcAvg[5], calcAvg[6], calcAvg[7],
                        calcRms[0], calcRms[1], calcRms[2], calcRms[3], calcRms[4], calcRms[5], calcRms[6], calcRms[7],
                        calcPwr[0], calcPwr[1], calcPwr[2], calcPwr[3], calcPwr[4], calcPwr[5], calcPwr[6], calcPwr[7]);
 
-    if (ret < 0 || ret >= sizeof(buf))
+    if (ret < 0 || ret >= size)
     {
         dadlib_panic("MQTT JSON buffer too small");
-    }
-
-    if (dadlib_mqtt_publish(MQTT_OUT_TOPIC, buf, 0, 0) < 0)
-    {
-        ESP_LOGW(TAG, "MQTT publish failed");
-        printf("%s\n", buf); // Print JSON to terminal every time
     }
 }
 
@@ -371,10 +364,13 @@ static void loop(spi_device_handle_t spi)
     // Step 2: calculate RMS and power for each channel, which uses the config params and so needs to hold the lock
     xSemaphoreTake(config_param_lock, portMAX_DELAY);
 
+    bool errorDetected = false;
+
     int startSample, endSample;
     if (!findEndpoints(&startSample, &endSample))
     {
         lastErrorTimeUs = esp_timer_get_time();
+        errorDetected = true;
         goto done;
     }
 
@@ -383,11 +379,18 @@ static void loop(spi_device_handle_t spi)
         calcRmsAndPower(ch, startSample, endSample);
     }
 
-    publishResults(); // Send to MQTT, uses the config params
+    char buf[512];
+    prepareResultsJson(buf, sizeof(buf));
 
     done:
     setLedStatus();
     xSemaphoreGive(config_param_lock);
+
+    if (!errorDetected && dadlib_mqtt_publish(MQTT_OUT_TOPIC, buf, 0, 0) < 0)
+    {
+        ESP_LOGW(TAG, "MQTT publish failed");
+        printf("%s\n", buf); // Print JSON to terminal every time
+    }
 }
 
 void app_main()
@@ -437,7 +440,14 @@ void app_main()
     dadlib_setup_pin_input(BUSY_PIN);
     dadlib_setup_pin_output(CS_PIN);
     dadlib_setup_pin_output(RESET_PIN);
+
+    dadlib_setup_pin_output(SCK_PIN);
+    dadlib_setup_pin_input(MISO_PIN);
+    dadlib_setup_pin_output(MOSI_PIN);
+
     dadlib_setup_pin_output(BLUE_LED);
+    dadlib_setup_pin_output(RED_LED);
+    dadlib_setup_pin_output(GREEN_LED);
 
     gpio_set_level(CONVST_PIN, 1);
     gpio_set_level(CS_PIN, 1);
